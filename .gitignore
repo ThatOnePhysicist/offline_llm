@@ -1,0 +1,25 @@
+# Rust artifacts
+target/
+Cargo.lock
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Compiled Rust/Python extension
+*.so
+*.dylib
+*.pyd
+
+# THE BIG ONES: Model files (Never upload these!)
+models/
+*.gguf
+*.safetensors
+tokenizer.json
+config.json
+
+.DS_Store
+**/.DS_Store
