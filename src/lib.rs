@@ -1,7 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-use pyo3::prelude::*;
+use pyo3::{ToPyErr, prelude::*};
 use pyo3::exceptions::PyRuntimeError;
 use candle_core::{Device, Tensor};
+use candle_core::IndexOp;
 use candle_transformers::models::quantized_qwen2::ModelWeights as QModel;
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
@@ -24,8 +25,8 @@ fn run_hybrid_forward(
     start_pos: usize,
     device: &Device
 ) -> PyResult<Tensor>{
-    let device_input = input.to_device(device).map_err(to_py_err)?;
-    model.forward(&device_input, start_pos).map_err(to_py_err)
+    // let device_input = input.to_device(device).map_err(to_py_err)?;
+    model.forward(input, start_pos).map_err(to_py_err)
 }
 
 /// Manages lifecycle of quantized models
@@ -43,7 +44,17 @@ impl ModelManager {
     /// Default attempts to initialize Metal and falls back to CPU. 
     #[new]
     pub fn new() -> PyResult<Self> {
-        let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+        // let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+        let device = match Device::new_metal(0) {
+            Ok(d) => {
+                println!("Metal GPU initialized");
+                d
+            },
+            Err(e) => {
+                println!("Metal failed {:?}. Falling back to CPU.", e);
+                Device::Cpu
+            }
+        };
         Ok(Self {
             device,
             current_model: None,
@@ -98,47 +109,58 @@ impl ModelManager {
     /// This method uses a sampling temperature of 0.7 and stops generation if 
     /// an EOS token is produced. 
     pub fn generate(&mut self, prompt: String, callback: PyObject) -> PyResult<()> {
-        let max_tokens = 1024;
+        let max_tokens = 2048;
         let model = self.current_model.as_mut().ok_or_else(|| PyRuntimeError::new_err("No model loaded"))?;
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| PyRuntimeError::new_err("No tokenizer loaded"))?;
 
+        // Prompt encoding
         let tokens_obj = tokenizer.encode(prompt, true).map_err(to_py_err)?;
         let prompt_tokens = tokens_obj.get_ids().to_vec();
         let mut tokens = prompt_tokens.clone();
-        let prompt_len = prompt_tokens.len();
+        // let prompt_len = prompt_tokens.len(); Maybe remove
 
         let mut logits_processor = LogitsProcessor::new(42, Some(0.7), None);
-        let mut prev_index = 0;
+        // let mut prev_index = 0; MAYBE REMOVE
         
         Python::with_gil(|py|{
             for i in 0..max_tokens {
-                let context_size = if i > 0 { 1 } else { tokens.len() };
-                let start_pos = tokens.len().saturating_sub(context_size);
-                
-                let input = Tensor::new(&tokens[start_pos..], &Device::Cpu).map_err(to_py_err)?
-                .unsqueeze(0).map_err(to_py_err)?;
 
-                let logits = run_hybrid_forward(model, &input, start_pos, &self.device).map_err(to_py_err)?;
-                
-                let logits = logits.squeeze(0).map_err(to_py_err)?
-                    .to_device(&Device::Cpu).map_err(to_py_err)?
-                    .to_dtype(candle_core::DType::F32).map_err(to_py_err)?;
+                // Release GIL 
+                // Wrap the forward pass in allow_threads so the Python UI remains responsive
+                // and the OS scheduler can handle the GPU driver efficiently.
+                let next_token = py.allow_threads(|| -> PyResult<u32> {
+                    let (input, start_pos) = if i==0 {
+                        // Process whole prompt
+                        let input = Tensor::new(&tokens[..], &self.device)
+                            .map_err(to_py_err)?
+                            .unsqueeze(0)
+                            .map_err(to_py_err)?;
+                    (input, 0)
+                    } else {
+                        // Process only last token
+                        // create a tensor directly on target device (Metal)
+                        let last_token = *tokens.last().unwrap();
+                        let input = Tensor::new(&[last_token], &self.device)
+                            .map_err(to_py_err)?
+                            .unsqueeze(0)
+                            .map_err(to_py_err)?;
+                        (input, tokens.len()-1)
+                    };
+                    let logits = model.forward(&input, start_pos).map_err(to_py_err)?;
+                    let logits = logits.squeeze(0).map_err(to_py_err)?;
+                    let logits = logits.to_device(&Device::Cpu).map_err(to_py_err)?.to_dtype(candle_core::DType::F32).map_err(to_py_err)?;
 
-
-                let next_token = logits_processor.sample(&logits).map_err(to_py_err)?;
-
+                    let next_token = logits_processor.sample(&logits).map_err(to_py_err)?;
+                    Ok(next_token)
+                })?;
                 tokens.push(next_token);
-                
                 // Stop tokens for Qwen2.
                 if next_token == 151643 || next_token == 151645 {
                     break;
                 }
 
-                // Decode and provides new characters to pass to Python.
-                let current_text = tokenizer.decode(&tokens[prompt_len..], true).map_err(to_py_err)?;
-                let new_text = current_text.chars().skip(prev_index).collect::<String>();
+                let new_text = tokenizer.decode(&[next_token], true).map_err(to_py_err)?;
                 if !new_text.is_empty() {
-                    prev_index += new_text.chars().count();
                     callback.call1(py, (new_text,))?;
                 }
             }

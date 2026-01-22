@@ -23,3 +23,6 @@ config.json
 
 .DS_Store
 **/.DS_Store
+
+ai_env/
+.venv/

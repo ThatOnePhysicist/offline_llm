@@ -300,7 +300,7 @@ def main():
                 live.update(
                     Panel(
                         Markdown(full_response),
-                        title=f"[bold cyan]{m_name}[/bold cyan]",
+                        title=f"[bold cyan]{m_name}[/bold cyan]\n[bold gold]{tps:.1f} tokens/sec[/bold gold]",
                         subtitle=f"[bold magenta]{tps:.1f} tokens/sec[/bold magenta]",
                         border_style = "cyan",
                     )

@@ -9,12 +9,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
-mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "5067d4f", features = ["metal", "accelerate"]}
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 serde = "1.0"
 indexmap = "2.7"
 either = "1.13"
-candle-core = "0.9.1"
-candle-transformers = "0.9.1"
+candle-core = { version = "0.9.1", features = ["metal"] }
+candle-transformers = { version = "0.9.1", features = ["metal"] }
+candle-nn = { version = "0.9.1" }
 tokenizers = "0.22.2"
