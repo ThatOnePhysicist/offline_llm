@@ -1,12 +1,24 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-use pyo3::{ToPyErr, prelude::*};
+use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use candle_core::{Device, Tensor};
-use candle_core::IndexOp;
-use candle_transformers::models::quantized_qwen2::ModelWeights as QModel;
-use candle_transformers::generation::LogitsProcessor;
-use tokenizers::Tokenizer;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::sampling::LlamaSampler;
+use std::num::NonZeroU32;
 use std::path::Path;
+use std::ffi::{c_char, c_void};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+unsafe extern "C" fn silent_log_callback(
+    _level: llama_cpp_sys_2::ggml_log_level, 
+    _text: *const c_char,
+    _user_data: *mut c_void,
+) {
+    // Intentionally left empty to supress output.
+}
 /*
     This Rust module handles the backend of the offline chat with Python handling the front-end. 
     Specifically, Rust handles the model switching, device management (metal/cpu), and token streams. 
@@ -19,22 +31,21 @@ fn to_py_err<E: std::fmt::Display>(err: E) -> PyErr {
 
 /// Forward pass checking input tensor is on the correct device 
 /// before running model.
-fn run_hybrid_forward(
-    model: &mut QModel,
-    input: &Tensor, 
-    start_pos: usize,
-    device: &Device
-) -> PyResult<Tensor>{
-    // let device_input = input.to_device(device).map_err(to_py_err)?;
-    model.forward(input, start_pos).map_err(to_py_err)
-}
+// fn run_hybrid_forward(
+//     model: &mut QModel,
+//     input: &Tensor, 
+//     start_pos: usize,
+//     device: &Device
+// ) -> PyResult<Tensor>{
+//     // let device_input = input.to_device(device).map_err(to_py_err)?;
+//     model.forward(input, start_pos).map_err(to_py_err)
+// }
 
 /// Manages lifecycle of quantized models
 #[pyclass]
 pub struct ModelManager {
-    device: Device,
-    current_model: Option<QModel>,
-    tokenizer: Option<Tokenizer>,
+    backend: LlamaBackend,
+    model: Option<LlamaModel>,
     current_name: String,
 }
 
@@ -45,20 +56,15 @@ impl ModelManager {
     #[new]
     pub fn new() -> PyResult<Self> {
         // let device = Device::new_metal(0).unwrap_or(Device::Cpu);
-        let device = match Device::new_metal(0) {
-            Ok(d) => {
-                println!("Metal GPU initialized");
-                d
-            },
-            Err(e) => {
-                println!("Metal failed {:?}. Falling back to CPU.", e);
-                Device::Cpu
-            }
-        };
+        let backend = LlamaBackend::init().map_err(to_py_err)?;
+
+        unsafe {
+            llama_cpp_sys_2::llama_log_set(Some(silent_log_callback), std::ptr::null_mut());
+        }
+
         Ok(Self {
-            device,
-            current_model: None,
-            tokenizer: None,
+            backend,
+            model: None,
             current_name: String::new(),
         })
     }
@@ -77,26 +83,17 @@ impl ModelManager {
         }
 
         // Clear existing model
-        self.current_model = None;
+        let model_params = LlamaModelParams::default();
         let path = Path::new(&gguf_path);
         
-        // Open GGUF file
-        let mut file = std::fs::File::open(path).map_err(to_py_err)?;
-        let content = candle_core::quantized::gguf_file::Content::read(&mut file).map_err(to_py_err)?;
-
         // Load Quantized Model
         // This automatically handles the "shape mismatch" by reading the GGUF metadata
-        let model = QModel::from_gguf(content, &mut file, &self.device).map_err(to_py_err)?;
+        let model = LlamaModel::load_from_file(&self.backend, path, &model_params).map_err(to_py_err)?;
 
-        // Load Tokenizer (Usually stays as a separate json file in the GGUF folder)
-        let tokenizer_path = path.parent().unwrap().join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(to_py_err)?;
-
-        self.current_model = Some(model);
-        self.tokenizer = Some(tokenizer);
+        self.model = Some(model);
         self.current_name = name;
 
-        Ok(format!("Successfully loaded GGUF model: {}", self.current_name))
+        Ok(format!("Successfully loaded: {}", self.current_name))
     }
 
     /// Generates response and streams to Python
@@ -109,63 +106,63 @@ impl ModelManager {
     /// This method uses a sampling temperature of 0.7 and stops generation if 
     /// an EOS token is produced. 
     pub fn generate(&mut self, prompt: String, callback: PyObject) -> PyResult<()> {
-        let max_tokens = 2048;
-        let model = self.current_model.as_mut().ok_or_else(|| PyRuntimeError::new_err("No model loaded"))?;
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| PyRuntimeError::new_err("No tokenizer loaded"))?;
+        let model = self.model.as_ref().ok_or_else(|| PyRuntimeError::new_err("No model loaded"))?;
+        
+        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(2048));
+        let mut ctx = model.new_context(&self.backend, ctx_params).map_err(to_py_err)?;
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let mut sampler = LlamaSampler::chain_simple([
+            // LlamaSampler::repen(model.n_vocab(), 1.1, 64, 64),
+            LlamaSampler::temp(0.7),
+            LlamaSampler::top_k(40),
+            LlamaSampler::top_p(0.95, 1),
+            // LlamaSampler::greedy(),
+            LlamaSampler::dist(seed),
+        ]);
 
         // Prompt encoding
-        let tokens_obj = tokenizer.encode(prompt, true).map_err(to_py_err)?;
-        let prompt_tokens = tokens_obj.get_ids().to_vec();
-        let mut tokens = prompt_tokens.clone();
-        // let prompt_len = prompt_tokens.len(); Maybe remove
+        // let tokens = model.str_to_token(&prompt, llama_cpp_2::model::AddBos::Always).map_err(to_py_err)?;
+        let tokens = model
+            .str_to_token(&prompt, llama_cpp_2::model::AddBos::Always)
+            .map_err(to_py_err)?;
 
-        let mut logits_processor = LogitsProcessor::new(42, Some(0.7), None);
-        // let mut prev_index = 0; MAYBE REMOVE
+        let mut batch = LlamaBatch::new(2048, 1);
         
-        Python::with_gil(|py|{
-            for i in 0..max_tokens {
+        for (i, &token) in tokens.iter().enumerate() {
+            batch.add(token, i as i32, &[0], i == tokens.len() - 1);
+        }
+        
+        // n_cur = 0;
+        let mut n_cur = tokens.len() as i32;
 
-                // Release GIL 
-                // Wrap the forward pass in allow_threads so the Python UI remains responsive
-                // and the OS scheduler can handle the GPU driver efficiently.
-                let next_token = py.allow_threads(|| -> PyResult<u32> {
-                    let (input, start_pos) = if i==0 {
-                        // Process whole prompt
-                        let input = Tensor::new(&tokens[..], &self.device)
-                            .map_err(to_py_err)?
-                            .unsqueeze(0)
-                            .map_err(to_py_err)?;
-                    (input, 0)
-                    } else {
-                        // Process only last token
-                        // create a tensor directly on target device (Metal)
-                        let last_token = *tokens.last().unwrap();
-                        let input = Tensor::new(&[last_token], &self.device)
-                            .map_err(to_py_err)?
-                            .unsqueeze(0)
-                            .map_err(to_py_err)?;
-                        (input, tokens.len()-1)
-                    };
-                    let logits = model.forward(&input, start_pos).map_err(to_py_err)?;
-                    let logits = logits.squeeze(0).map_err(to_py_err)?;
-                    let logits = logits.to_device(&Device::Cpu).map_err(to_py_err)?.to_dtype(candle_core::DType::F32).map_err(to_py_err)?;
+        Python::with_gil(|py| {
+                ctx.decode(&mut batch).map_err(to_py_err)?;
 
-                    let next_token = logits_processor.sample(&logits).map_err(to_py_err)?;
-                    Ok(next_token)
-                })?;
-                tokens.push(next_token);
-                // Stop tokens for Qwen2.
-                if next_token == 151643 || next_token == 151645 {
-                    break;
+                for _ in 0..1024 {
+                    let next_token= sampler.sample(&ctx, batch.n_tokens() - 1);
+
+                    if model.is_eog_token(next_token) {
+                        break;
+                    }
+
+                    let output_bytes = model.token_to_bytes(next_token, llama_cpp_2::model::Special::Plaintext).map_err(to_py_err)?;
+                    let output_str = String::from_utf8_lossy(&output_bytes).into_owned();
+                    
+                    // Add this temporary debug line:
+                    // println!("DEBUG: Generated token: [{}]", output_str);
+
+                    callback.call1(py, (output_str,))?;
+                    batch.clear();
+                    batch.add(next_token, n_cur, &[0], true);
+                    n_cur += 1;
+
+                    ctx.decode(&mut batch).map_err(to_py_err)?;
                 }
-
-                let new_text = tokenizer.decode(&[next_token], true).map_err(to_py_err)?;
-                if !new_text.is_empty() {
-                    callback.call1(py, (new_text,))?;
-                }
-            }
-            Ok(())
-        })
+                Ok(())
+            })
     }
 }
 

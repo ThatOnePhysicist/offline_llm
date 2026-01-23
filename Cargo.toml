@@ -14,7 +14,7 @@ anyhow = "1.0"
 serde = "1.0"
 indexmap = "2.7"
 either = "1.13"
-candle-core = { version = "0.9.1", features = ["metal"] }
-candle-transformers = { version = "0.9.1", features = ["metal"] }
 candle-nn = { version = "0.9.1" }
 tokenizers = "0.22.2"
+llama-cpp-2 = "0.1.132"
+llama-cpp-sys-2 = "0.1.132"

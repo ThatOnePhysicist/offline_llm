@@ -91,7 +91,7 @@ def load_model_once(model_id: str, model_name: str):
 
     target_path = model_id
 
-    handler.load_model(model_name, target_path)
+    # handler.load_model(model_name, target_path)
 
     _current_model_name = model_name
     Console().print(f"[dim]Model {model_name} loaded in Metal VRAM.[/dim]")
@@ -262,6 +262,9 @@ def main():
             full_response = ""
             first_token_received = False
             token_count = 0
+            
+            ttft = 0.0
+            start_time_request = time.perf_counter()
             start_time = 0
 
             progress = Progress(
@@ -280,12 +283,17 @@ def main():
                     first_token_received, \
                     token_count, \
                     start_time, \
+                    start_time_request, \
+                    ttft, \
                     color_idx
 
                 if not first_token_received:
-                    progress.stop()
+                    ttft = time.perf_counter() - start_time_request
+                    # print(f"Time to first token: {ttft:.4f}s")
+                # if not first_token_received:
                     start_time = time.perf_counter()
                     first_token_received = True
+                    progress.stop()
 
                 token_count += 1
                 full_response += token
@@ -300,17 +308,18 @@ def main():
                 live.update(
                     Panel(
                         Markdown(full_response),
-                        title=f"[bold cyan]{m_name}[/bold cyan]\n[bold gold]{tps:.1f} tokens/sec[/bold gold]",
+                        title=f"[bold cyan]{m_name}[/bold cyan]\n[bold gold]{tps:.1f} tokens/sec[/bold gold] | [dim]Reading: {ttft:.3f}s[/dim]",
                         subtitle=f"[bold magenta]{tps:.1f} tokens/sec[/bold magenta]",
                         border_style = "cyan",
                     )
                 )
 
-            console.print(f"[bold blue] Assitant ({m_name}): [/bold blue]")
+            # console.print(f"[bold blue] Assitant ({m_name}): [/bold blue]")
             # progress.start()
 
             with Live(console=console, refresh_per_second=20) as live:
-                live.update(Panel(progress, title=m_name, border_style="bright_magenta"))
+                # live.update(Panel(progress, title=m_name, border_style="bright_magenta"))
+                start_time_request = time.perf_counter()
                 handler.generate(prompt, stream_callback)
                 live.update(Panel(Markdown(full_response), title=f"[bold blue]{m_name}[/bold blue]", border_style="bright_green"))
 
