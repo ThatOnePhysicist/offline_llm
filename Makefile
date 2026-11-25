@@ -7,7 +7,17 @@ SO_EXT = so
 TARGET_DIR = ./target/release
 LIB_OUT = $(LIB_NAME).$(SO_EXT)
 
-.PHONY: all clean 
+MODEL ?= ../models/DeepSeek-Prover-V2-7B-Q4_K_M.gguf
+PNP_REPO ?= $(HOME)/pequalnp-proofs
+
+.PHONY: all clean worker test
+
+# Continuous Lean prover (see README.md). Example: make worker MODEL=/path/to/model.gguf
+worker: build
+	caffeinate -is $(PYTHON_ENV) worker.py --model $(MODEL) --repo $(PNP_REPO)
+
+test:
+	$(PYTHON_ENV) -m unittest discover -s tests -v
 
 # Default: build and run
 all: setup build run

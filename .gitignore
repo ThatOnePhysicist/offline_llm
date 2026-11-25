@@ -26,3 +26,6 @@ config.json
 
 ai_env/
 .venv/
+
+# Prover worker logs
+prover_runs/

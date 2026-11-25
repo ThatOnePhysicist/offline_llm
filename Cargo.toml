@@ -7,7 +7,14 @@ edition = "2024"
 name = "model_handler"
 crate-type = ["cdylib"]
 
+[features]
+# On by default so `cargo build --release` produces the Python extension exactly as before.
+# `cargo test --no-default-features` links against libpython so the Rust unit tests can run.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
-llama-cpp-2 = "0.1.132"
-llama-cpp-sys-2 = "0.1.132"
+pyo3 = "0.22"
+# Pinned exactly: the chat-template and sampler calls in src/lib.rs match this version's API.
+llama-cpp-2 = "=0.1.132"
+llama-cpp-sys-2 = "=0.1.132"
