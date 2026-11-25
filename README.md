@@ -42,9 +42,10 @@ It follows the desk's rules in [join.txt](https://pequalnp.com/join.txt):
    ```bash
    make build          # first build recompiles llama.cpp (a few minutes)
    ```
-   The chat script works unchanged. `generate(prompt, callback)` still defaults to an 8192-token
-   context and returns the stop reason (`complete`, `length_limit`, `context_full`, or `stopped`
-   when the callback returns `False`). A prompt that does not fit returns `context_full`, so
+   The chat script works unchanged: `generate(prompt, callback, temperature)` and
+   `count_tokens(text)` keep the signatures it calls. `generate` still defaults to an 8192-token
+   context and a 1024-token reply, and returns the stop reason (`complete`, `length_limit`,
+   `context_full`, or `stopped` when the callback returns `False`). A prompt that does not fit returns `context_full`, so
    auto-retry can trim and try again. Token counts come from `last_usage()`.
 
    If your working copy has changes that never reached GitHub (server sync, auto-retry), commit

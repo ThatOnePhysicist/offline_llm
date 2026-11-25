@@ -199,6 +199,16 @@ impl ModelManager {
         self.current_name.clone()
     }
 
+    /// Returns the exact token count for a given string using the model's tokenizer.
+    pub fn count_tokens(&self, text: String) -> PyResult<usize> {
+        let model: &LlamaModel = self.model.as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No model loaded"))?;
+        let tokens = model
+            .str_to_token(&text, AddBos::Never)
+            .map_err(to_py_err)?;
+        Ok(tokens.len())
+    }
+
     /// Context length the loaded model was trained with.
     pub fn n_ctx_train(&self) -> PyResult<u32> {
         let model = self.model.as_ref()
@@ -239,10 +249,11 @@ impl ModelManager {
     /// * `prompt` - Input prompt for model.
     /// * `callback` - Called with each new piece of text. Returning `False` stops generation;
     ///   any other return value (including `None`) continues.
+    /// * `temperature` - Sampling temperature (default 0.7; third positional argument, as
+    ///   `chat_script_r.py` passes it). 0 or less samples greedily.
     /// * `max_tokens` - Most new tokens to generate (default 1024).
     /// * `ctx_size` - Context window in tokens, prompt plus output (default 8192).
-    /// * `temperature`, `top_k`, `top_p` - Sampling settings (defaults 0.7, 40, 0.95). A temperature
-    ///   of 0 or less samples greedily.
+    /// * `top_k`, `top_p` - Sampling settings (defaults 40, 0.95).
     /// * `repeat_penalty` - Penalty on the last 64 tokens; 1.0 (default) disables it.
     /// * `seed` - Sampling seed; defaults to the current time.
     /// * `add_bos` - Prepend the beginning-of-sequence token (default true).
@@ -262,9 +273,9 @@ impl ModelManager {
     #[pyo3(signature = (
         prompt,
         callback,
+        temperature = 0.7,
         max_tokens = 1024,
         ctx_size = 8192,
-        temperature = 0.7,
         top_k = 40,
         top_p = 0.95,
         repeat_penalty = 1.0,
@@ -277,9 +288,9 @@ impl ModelManager {
         py: Python<'_>,
         prompt: String,
         callback: PyObject,
+        temperature: f32,
         max_tokens: usize,
         ctx_size: u32,
-        temperature: f32,
         top_k: i32,
         top_p: f32,
         repeat_penalty: f32,
