@@ -30,7 +30,7 @@ class Generation:
     answer: str         # the same with <think>...</think> reasoning removed
     prompt_tokens: int
     tokens: int
-    stop_reason: str    # eos | max_tokens | context | callback
+    stop_reason: str    # complete | length_limit | context_full | stopped
     seconds: float
 
     @property
@@ -132,13 +132,14 @@ class LocalModel:
 
         s = self.settings
         start = time.perf_counter()
-        prompt_tokens, tokens, reason = self.handler.generate(
+        reason = self.handler.generate(
             prompt, callback,
             max_tokens=s.max_tokens, ctx_size=s.ctx_size, temperature=s.temperature,
             top_k=s.top_k, top_p=s.top_p, repeat_penalty=s.repeat_penalty, add_bos=add_bos,
         )
         text = "".join(pieces)
-        return Generation(text, strip_reasoning(text), prompt_tokens, tokens, reason,
+        prompt_tokens, tokens = self.handler.last_usage()
+        return Generation(text, strip_reasoning(text), prompt_tokens, tokens, str(reason),
                           time.perf_counter() - start)
 
     def count_hint(self, text: str) -> int:
@@ -159,7 +160,7 @@ class ScriptedModel:
              on_text: Callable[[str], None] | None = None) -> Generation:
         self.calls.append(list(messages))
         text = self.answers[min(len(self.calls) - 1, len(self.answers) - 1)]
-        return Generation(text, strip_reasoning(text), 0, len(text) // 3, "eos", 0.0)
+        return Generation(text, strip_reasoning(text), 0, len(text) // 3, "complete", 0.0)
 
     def count_hint(self, text: str) -> int:
         return len(text) // 3

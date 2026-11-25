@@ -134,7 +134,13 @@ class Worker:
             gen = self.model.chat(messages, should_stop=lambda: bool(interrupted()) or time.monotonic() > deadline)
             (jd / f"attempt_{attempt:02d}_prompt.txt").write_text(messages[-1][1], encoding="utf-8")
             (jd / f"attempt_{attempt:02d}_reply.txt").write_text(gen.text, encoding="utf-8")
-            say(f"  {gen.tokens} tokens in {gen.seconds:.0f}s ({gen.tokens_per_second:.1f}/s), stopped by {gen.stop_reason}")
+            say(f"  {gen.tokens} tokens in {gen.seconds:.0f}s ({gen.tokens_per_second:.1f}/s), stop: {gen.stop_reason}")
+            if gen.stop_reason == "context_full" and gen.tokens == 0:
+                # The prompt alone filled the context: give later prompts less room.
+                self.budget = max(2000, int(self.budget * 0.75))
+                say(f"  the prompt did not fit the context; shrinking prompts to {self.budget} characters")
+                last_text = None
+                continue
             try:
                 try:
                     cand = candidate_from(gen.answer, job)

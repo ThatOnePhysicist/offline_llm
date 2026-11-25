@@ -42,18 +42,34 @@ It follows the desk's rules in [join.txt](https://pequalnp.com/join.txt):
    ```bash
    make build          # first build recompiles llama.cpp (a few minutes)
    ```
-   The chat script works unchanged: `generate(prompt, callback)` behaves as before.
+   The chat script works unchanged. `generate(prompt, callback)` still defaults to an 8192-token
+   context and returns the stop reason (`complete`, `length_limit`, `context_full`, or `stopped`
+   when the callback returns `False`). A prompt that does not fit returns `context_full`, so
+   auto-retry can trim and try again. Token counts come from `last_usage()`.
+
+   If your working copy has changes that never reached GitHub (server sync, auto-retry), commit
+   them first and merge this branch. Only `src/lib.rs`, `Cargo.toml`, `Makefile`, `README.md` and
+   `.gitignore` overlap. For `src/lib.rs` and `Cargo.toml` take this branch's version; it keeps
+   the return values your chat script relies on. Your `chat_script_r.py` and
+   `conversation_sync.py` are not touched.
 
 2. **Get a Lean prover model.** General models (Qwen-Coder, DeepSeek-R1-Distill) rarely write
-   Lean that compiles. Models trained for Lean do much better:
-   - [DeepSeek-Prover-V2-7B](https://huggingface.co/deepseek-ai/DeepSeek-Prover-V2-7B), as a GGUF
-     build such as `Mungert/DeepSeek-Prover-V2-7B-GGUF` (`Q4_K_M`, about 4.5 GB). Its attention
-     uses a lot of memory per token, so keep `--ctx 8192` on a 16 GB Mac.
+   Lean that compiles. Models trained for Lean do much better. All three below are Qwen3 or
+   DeepSeek architectures, which the pinned llama.cpp loads:
+   - [Pythagoras-Prover-4B](https://huggingface.co/Pythagoras-LM/Pythagoras-Prover-4B)
+     (Apache-2.0, Qwen3-4B). It is the strongest small open prover on miniF2F and small enough to
+     leave room for Lean and a long context on 16 GB. Use a GGUF build at Q8_0 or Q6_K (the
+     model page links community quantizations, or convert it with llama.cpp's
+     `convert_hf_to_gguf.py`), with `--ctx 16384 --max-tokens 8192`.
    - [Goedel-Prover-V2-8B](https://huggingface.co/Goedel-LM/Goedel-Prover-V2-8B) (Apache-2.0,
-     Qwen3-based), stronger on benchmarks and lighter on memory per token. Use a GGUF build with
-     `--ctx 16384 --max-tokens 8192`.
+     Qwen3-8B). Close behind, at twice the size. Q4_K_M, `--ctx 16384 --max-tokens 8192`.
+   - [DeepSeek-Prover-V2-7B](https://huggingface.co/deepseek-ai/DeepSeek-Prover-V2-7B), as a GGUF
+     build such as `Mungert/DeepSeek-Prover-V2-7B-GGUF` (Q4_K_M). Weaker than the two above, and
+     its attention uses about three times the memory per token, so keep `--ctx 8192`.
 
-   Put the `.gguf` file in `~/ai_build/models/`.
+   These were trained on an older Lean and Mathlib than the pequalnp project uses, so expect
+   renamed-lemma errors; the repair loop feeds those back. Put the `.gguf` file in
+   `~/ai_build/models/`.
 
 3. **Lean and the pequalnp project.**
    ```bash

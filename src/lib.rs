@@ -135,6 +135,8 @@ pub struct ModelManager {
     backend: LlamaBackend,
     model: Option<LlamaModel>,
     current_name: String,
+    /// Token counts of the last `generate` call: (prompt, generated).
+    last_usage: (usize, usize),
 }
 
 
@@ -154,6 +156,7 @@ impl ModelManager {
                 backend,
                 model: None,
                 current_name: String::new(),
+                last_usage: (0, 0),
             }
         )
     }
@@ -237,7 +240,7 @@ impl ModelManager {
     /// * `callback` - Called with each new piece of text. Returning `False` stops generation;
     ///   any other return value (including `None`) continues.
     /// * `max_tokens` - Most new tokens to generate (default 1024).
-    /// * `ctx_size` - Context window in tokens, prompt plus output (default 4096).
+    /// * `ctx_size` - Context window in tokens, prompt plus output (default 8192).
     /// * `temperature`, `top_k`, `top_p` - Sampling settings (defaults 0.7, 40, 0.95). A temperature
     ///   of 0 or less samples greedily.
     /// * `repeat_penalty` - Penalty on the last 64 tokens; 1.0 (default) disables it.
@@ -245,8 +248,14 @@ impl ModelManager {
     /// * `add_bos` - Prepend the beginning-of-sequence token (default true).
     ///
     /// ### Returns
-    /// `(prompt_tokens, generated_tokens, stop_reason)` where `stop_reason` is one of
-    /// `eos`, `max_tokens`, `context`, `callback`.
+    /// The stop reason, as before:
+    /// * `complete` - the model ended its answer.
+    /// * `length_limit` - `max_tokens` were generated.
+    /// * `context_full` - the context window is full (also returned, with nothing generated,
+    ///   when the prompt alone does not fit, so the caller can trim history and retry).
+    /// * `stopped` - the callback returned `False`.
+    ///
+    /// Token counts of the call are available from `last_usage()`.
     ///
     /// ### Note
     /// The defaults reproduce the earlier behaviour, so `generate(prompt, callback)` works as before.
@@ -254,7 +263,7 @@ impl ModelManager {
         prompt,
         callback,
         max_tokens = 1024,
-        ctx_size = 4096,
+        ctx_size = 8192,
         temperature = 0.7,
         top_k = 40,
         top_p = 0.95,
@@ -276,7 +285,8 @@ impl ModelManager {
         repeat_penalty: f32,
         seed: Option<u32>,
         add_bos: bool,
-    ) -> PyResult<(usize, usize, String)> {
+    ) -> PyResult<String> {
+        self.last_usage = (0, 0);
         let model: &LlamaModel = self.model.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No model loaded"))?;
         if ctx_size < 64 {
@@ -322,11 +332,9 @@ impl ModelManager {
             return Err(PyValueError::new_err("empty prompt"));
         }
         if tokens.len() + 1 >= ctx_size as usize {
-            return Err(PyValueError::new_err(format!(
-                "prompt is {} tokens, which does not fit a context of {} tokens",
-                tokens.len(),
-                ctx_size
-            )));
+            // No room to answer: report it like a full context so the caller can trim and retry.
+            self.last_usage = (tokens.len(), 0);
+            return Ok("context_full".to_string());
         }
 
         // Feed the prompt in chunks; only the last token needs logits.
@@ -343,9 +351,11 @@ impl ModelManager {
         }
 
         let mut n_cur: i32 = tokens.len() as i32;
-        let budget: usize = max_tokens.min(ctx_size as usize - tokens.len() - 1);
+        let room: usize = ctx_size as usize - tokens.len() - 1;
+        let budget: usize = max_tokens.min(room);
         let mut produced: usize = 0;
-        let mut stop_reason: &str = "max_tokens";
+        // If the loop runs out of budget: the requested limit, or the context, whichever was smaller.
+        let mut stop_reason: &str = if max_tokens <= room { "length_limit" } else { "context_full" };
         let mut text = Utf8Stream::default();
 
         // Generation loop
@@ -355,7 +365,7 @@ impl ModelManager {
 
             // Check for end of generation
             if model.is_eog_token(next_token) {
-                stop_reason = "eos";
+                stop_reason = "complete";
                 break;
             }
             produced += 1;
@@ -373,7 +383,7 @@ impl ModelManager {
             if !piece.is_empty() {
                 let answer: PyObject = callback.call1(py, (piece,))?;
                 if let Ok(false) = answer.extract::<bool>(py) {
-                    stop_reason = "callback";
+                    stop_reason = "stopped";
                     break;
                 }
             }
@@ -385,7 +395,7 @@ impl ModelManager {
 
             // Check position before decoding for safety
             if n_cur >= ctx_size as i32 {
-                stop_reason = "context";
+                stop_reason = "context_full";
                 break;
             }
 
@@ -397,7 +407,13 @@ impl ModelManager {
         if !rest.is_empty() {
             callback.call1(py, (rest,))?;
         }
-        Ok((tokens.len(), produced, stop_reason.to_string()))
+        self.last_usage = (tokens.len(), produced);
+        Ok(stop_reason.to_string())
+    }
+
+    /// Token counts of the last `generate` call: `(prompt_tokens, generated_tokens)`.
+    pub fn last_usage(&self) -> (usize, usize) {
+        self.last_usage
     }
 }
 
