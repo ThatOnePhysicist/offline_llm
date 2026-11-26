@@ -1,15 +1,26 @@
-from typing import Any
-
-from rich import prompt
-
-
 import model_handler  # Rust lib.rs
+from conversation_sync import (
+    sync_on_save,
+    manual_sync_all,
+    list_server_conversations,
+    download_from_server,
+    check_server_status
+)
+import logging
 import os
+import sys
 import time
 import json
+import uuid
 from datetime import datetime
 from pathlib import Path
-from rich.color import Color
+
+try:
+    import pyperclip
+    _CLIPBOARD_AVAILABLE = True
+except ImportError:
+    _CLIPBOARD_AVAILABLE = False
+
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -29,13 +40,70 @@ It supports dynamic model swapping between 'Coding' and 'Reasoning' models
 based on the user's input.
 """
 
+def _load_config():
+    config_path = Path(__file__).parent / "config.toml"
+    defaults = {
+        "model": {
+            "default_name" : "Qwen2.5-Coder-7B",
+            "default_path" : "",
+            "path_7b" : "",
+            "path_14b" : "",
+        },
+        "context" : {"max_tokens": 7400},
+        "server" : {"url": "", "enabled": False, "auto_sync": False},
+        "logging" : {"level": "WARNING", "log_file": "llm_chat.log"}
+    }
+
+    if not config_path.exists():
+        print(
+            f"[warn] config.toml not found at {config_path}. Using defaults. \n\
+                    Create config.toml next to this script to configure paths.",
+            file = sys.stderr,
+        )
+        return defaults
+
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib
+        
+        with open(config_path, "rb") as f:
+            loaded = tomllib.load(f)
+    except Exception as exc:
+        print(f"[warn] Failed to parse config.toml: {exc}. Using defaults.", file = sys.stderr)
+        return defaults
+
+    for section, values in loaded.items():
+        if isinstance(values, dict) and isinstance(defaults.get(section), dict):
+            defaults[section].update(values)
+        else:
+            defaults[section] = values
+    
+    return defaults
+
+CONFIG = _load_config()
+
+_log_level = getattr(logging, CONFIG["logging"].get("level", "WARNING").upper(), logging.WARNING)
+_log_file = CONFIG["logging"].get("log_file", "llm_chat.log")
+
+logging.basicConfig(
+    filename = Path(__file__).parent / _log_file,
+    level = _log_level,
+    format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt = "%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("llm_chat")
+
+###########
+# Globals #
+###########
+REPLY_TOKENS = 1024  # must match generate()'s max_tokens
+MSG_OVERHEAD = 4     # <|im_start|>role\n ... <|im_end|>\n
 console = Console()
 
 # Local path configs
 base_path = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(
-    base_path, "..", "models", "qwen2.5-coder-7b-instruct-q5_k_m.gguf"
-)
 
 # Conversation storage path
 CONVERSATION_DIR = Path(base_path) / "conversations"
@@ -46,18 +114,46 @@ handler = None
 _current_model_name = None
 
 # Conversation state
-conversation_history = []
-current_system_prompt = ""
-MAX_CONTEXT_TOKENS = 3700
+MAX_CONTEXT_TOKENS = CONFIG["context"].get("max_tokens", 7400)
+
+current_temperature: float = 0.7
+last_assistant_response: str = ""
 
 class ConversationManager:
     """Manages conversation history, context window, and persistence."""
 
     def __init__(self, max_tokens = MAX_CONTEXT_TOKENS) -> None:
-        self.history = []
-        self.system_prompt = ""
-        self.max_tokens = MAX_CONTEXT_TOKENS
-        self.current_file = None
+        self.history : list = []
+        self.system_prompt : str = ""
+        self.max_tokens : int = max_tokens
+        self.current_file : str |  None = None
+        self.saved_message_ids : set = set() # tracks which messages are already saved.
+        self._prompt_locked : bool = False
+
+    def set_system_prompt(self, prompt: str, force: bool = False) -> None:
+        """
+        
+        """
+        if self._prompt_locked and not force:
+            return
+        self.system_prompt = prompt
+        self._prompt_locked = True
+
+    def count_tokens(self, text: str) -> int:
+        if handler is not None:
+            try: 
+                return handler.count_tokens(text)
+            except Exception as exc:
+                log.debug("Rust count_tokens failed, using heuristic: %s", exc)
+        return len(text) // 4
+    
+    def estimate_tokens(self, text: str) -> int:
+        """
+        Rough token estimation (approx. 1 token ~ 4 chars in English).
+        Considering this is just for offline use, this should be okay. 
+        If necessary, will look into using a tokenizer. 
+        """
+        return self.count_tokens(text)
 
     def add_message(self, role: str, content: str):
         """
@@ -65,6 +161,7 @@ class ConversationManager:
         """
         self.history.append(
             {
+                "id" : str(uuid.uuid4()),
                 "role" : role,
                 "content" : content,
                 "timestamp" : datetime.now().isoformat()
@@ -73,30 +170,15 @@ class ConversationManager:
 
         if role == "user" and self.is_near_limit(threshold = 0.85):
             new_message = self.history.pop()
-
             filepath = self.auto_save_and_clear(keep_last_n = 2)
 
             console.print(f"\n[yellow]Context limit nearing 85%[/yellow]")
             console.print(f"\n[green]Auto-saved to:[/green] [cyan]{filepath}[/cyan]")
-            console.print(f"\n[dim]Keeping last 2 exchanges for continuty with current message[/dim]")
+            console.print(f"\n[dim]Keeping last 2 exchanges for continuty[/dim]")
 
             self.history.append(new_message)
-
-    def set_system_prompt(self, prompt: str):
-        """
-        Set system prompt.
-        """
-        self.system_prompt = prompt
     
-    def estimate_tokens(self, text: str) -> int:
-        """
-        Rought token estimation (approx. 1 token ~ 4 chars in English).
-        Considering this is just for offline use, this should be okay. 
-        If necessary, will look into using a tokenizer. 
-        """
-        return len(text) // 4
-    
-    def is_near_limit(self, threshold = 0.90) -> bool:
+    def is_near_limit(self, threshold = 0.85) -> bool:
         """
         Checks if approaching context limit.
 
@@ -105,8 +187,8 @@ class ConversationManager:
         threshold : float
             Trigger limit [default] 90%.
         """
-        current_tokens = self.estimate_tokens("".join(msg["content"] for msg in self.history))
-        return current_tokens >= (self.max_tokens * threshold)
+        current_tokens = self.count_tokens("".join(msg["content"] for msg in self.history))
+        return current_tokens >= self.max_tokens * threshold
 
     def get_trimmed_history(self) -> list:
         """
@@ -114,13 +196,13 @@ class ConversationManager:
         Keeps most recent messages and ensures sytem prompt is always included.
         """
         system_tokens = self.estimate_tokens(self.system_prompt)
-        available_tokens = self.max_tokens - system_tokens
+        available_tokens = self.max_tokens - system_tokens - REPLY_TOKENS
 
         trimmed = []
         token_count = 0
 
         for msg in reversed(self.history):
-            msg_tokens = self.estimate_tokens(msg["content"])
+            msg_tokens = self.estimate_tokens(msg["content"]) + MSG_OVERHEAD
             if token_count + msg_tokens > available_tokens:
                 break
             trimmed.insert(0, msg)
@@ -155,23 +237,85 @@ class ConversationManager:
             If True, starts fresh session, if False keeps current_file
         """
         self.history = []
+        self.saved_message_ids = set()
+        self._prompt_locked = False
+        self.system_prompt = ""
         if clear_file_tracking:
             self.current_file = None
 
-    def save(self, filename: str = None) -> str:
+    def save(self, filename: str | None = None, append_mode: bool | None = None) -> str:
         """
         Save conversation to JSON file.
+
+        Parameters
+        ----------
+        filename : str
+            File name to save to. If None, uses current_file or creates new timestamp file.
+        append_mode : bool
+            If True, appends new file instead of overwriting. 
         """
+        # Determine file name
         if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"conversation_{timestamp}.json"
+            if self.current_file:
+                filename = self.current_file
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"conversation_{timestamp}.json"
         
         filepath = CONVERSATION_DIR / filename
 
+        # Autodetect append_mode if not specified
+        if append_mode is None:
+            append_mode = (filename == self.current_file) and filepath.exists()
+        
+        # Handle append mode
+        if append_mode and filepath.exists():
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+                
+                existing_history = existing_data.get("history", [])
+
+                existing_ids = {m.get("id") for m in existing_history if m.get("id")}
+
+                new_messages = []
+                for msg in self.history:
+                    msg_id = msg.get("id")
+                    if msg_id and msg_id in (self.saved_message_ids | existing_ids):
+                        continue
+                    if not msg_id:
+                        ts = msg.get("timestamp")
+                        if any(m.get("timestamp") == ts for m in existing_history):
+                            continue
+                    
+                    new_messages.append(msg)
+                    if msg_id:
+                        self.saved_message_ids.add(msg_id)
+                
+                merged_history = existing_history + new_messages
+                created = existing_data.get("created", datetime.now().isoformat())
+
+                # print(f"[DEBUG] Append mode: {len(existing_history)} existing + {len(new_messages)} new = {len(merged_history)} total")
+
+            except (json.JSONDecodeError, FileNotFoundError) as exc:
+                log.warning("Append-mode read failed (%s); falling back to full save.", exc)
+                merged_history = self.history
+                created = datetime.now().isoformat()
+                # print(f"[DEBUG] File corrupted/missing saving all {len(merged_history)} messages")
+        else:
+            merged_history = self.history
+            created = datetime.now().isoformat()
+
+            for msg in self.history:
+                if msg_id := msg.get("id"):
+                    self.saved_message_ids.add(msg_id)
+
+            # print(f"[DEBUG] New save: {len(merged_history)} messages")
+        
         data = {
-            "created": datetime.now().isoformat(),
+            "created": created,
             "system_prompt": self.system_prompt,
-            "history": self.history,
+            "history": merged_history,
             "max_tokens": self.max_tokens
         }
 
@@ -196,20 +340,33 @@ class ConversationManager:
         str
             Path to saved conversation
         """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if self.current_file:
             filename = self.current_file
+            append_mode = True
         else:
-            filename = f"conversation_{timestamp}"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"auto_save_{timestamp}.json"
+            append_mode = False
+        
+        # print(f"[DEBUG] Auto-save before: {len(self.history)} messages in memory")
 
-        filepath = self.save(filename)
+        filepath = self.save(filename, append_mode = append_mode)
+
+        try:
+            sync_on_save(filepath)
+        except Exception as exc:
+            log.warning(f"Server sync after auto-save failed: %s", exc)
+
 
         if keep_last_n > 0:
             keep_count = keep_last_n * 2
-            kept_messages = self.history[-keep_count::] if len(self.history) > keep_count else self.history
+            kept_messages = self.history[-keep_count:] if len(self.history) > keep_count else self.history
             self.history = kept_messages
+            self.saved_message_ids = set()
+            # print(f"[DEBUG] Auto-save after: {len(self.history)} messages kept in memory")
         else:
             self.history = []
+            self.saved_message_ids = set()
         
         return filepath
 
@@ -229,6 +386,8 @@ class ConversationManager:
         self.history = data.get("history", [])
         self.max_tokens = data.get("max_tokens", MAX_CONTEXT_TOKENS)
         self.current_file = filename
+        self._prompt_locked = bool(self.system_prompt)
+        self.saved_message_ids = {m["id"] for m in self.history if m.get("id")}
 
         return True
 
@@ -237,17 +396,21 @@ class ConversationManager:
         List all saved conversations.
         """
         conversations = []
-        for filepath in CONVERSATION_DIR.glob("conversation_*.json"):
-            with open(filepath, "r", encoding = "utf-8") as f:
-                data = json.load(f)
-            conversations.append(
-                {
-                    "filename": filepath.name,
-                    "created": data.get("created", "Unknown"),
-                    "message_count": len(data.get("history", []))
-                }
-            )
-        
+
+        for filepath in CONVERSATION_DIR.glob("*.json"):
+            try:
+                with open(filepath, "r", encoding = "utf-8") as f:
+                    data = json.load(f)
+                conversations.append(
+                    {
+                        "filename": filepath.name,
+                        "created": data.get("created", "Unknown"),
+                        "message_count": len(data.get("history", []))
+                    }
+                )
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("Skipping unreadable conversation file %s: %s", filepath.name, exc)
+
         return sorted(conversations, key = lambda x: x["created"], reverse = True)
 
     def get_stats(self) -> dict:
@@ -259,7 +422,7 @@ class ConversationManager:
         assistant_messages = sum(1 for msg in self.history if msg["role"] == "assistant")
 
         total_chars = sum(len(msg["content"]) for msg in self.history)
-        estimated_tokens = self.estimate_tokens("".join(msg["content"] for msg in self.history))
+        estimated_tokens = self.count_tokens("".join(msg["content"] for msg in self.history))
 
         percentage_used = (estimated_tokens / self.max_tokens) * 100
         context_usage = f"{estimated_tokens}/{self.max_tokens}"
@@ -281,27 +444,7 @@ class ConversationManager:
 # Global conversation manager
 conv_manager = ConversationManager()
 
-def clean_output(text: str) -> str:
-    """
-    Removes chat-specific tokens from the model input.
-    
-    Parameters
-    ----------
-    text : str
-        Raw string from tokenizer.
-    
-    Returns
-    -------
-    str 
-        Cleaned text for terminal.    
-    """
-
-    for token in ("<|im_end|>", "<|im_start|>"):
-        text = text.replace(token, "")
-    return text.strip()
-
-
-def load_model_once(model_id: str, model_name: str):
+def load_model_once(model_path: str, model_name: str):
     """
     Uses the Rust ModelManager to swap models in VRAM.
 
@@ -315,221 +458,374 @@ def load_model_once(model_id: str, model_name: str):
     global _current_model_name, handler
 
     if _current_model_name == model_name:
-        return
+        return True
 
     if handler is None:
         handler = model_handler.ModelManager()
 
-    console.print(
-        f"[bold yellow] Initializing engine for {model_name}...[/bold yellow]"
-    )
+    console.print(f"[bold yellow]Initializing engine for {model_name}...[/bold yellow]")
 
     try:
-        if not os.path.exists(model_id):
-            raise FileNotFoundError(f"File not found at: {model_id}")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"File not found at: {model_path}")
 
         # Rust reads GGUF and maps tensors
-        result = handler.load_model(model_name, model_id)
+        result = handler.load_model(model_name, model_path)
         console.print(f"[green]{result}[/green]")
         _current_model_name = model_name
+        return True
 
-    except Exception as e:
-        console.print(f"[bold red]Load Error:[/bold red] {e}")
-        raise e
-
-    target_path = model_id
-
-    # handler.load_model(model_name, target_path)
-
-    _current_model_name = model_name
-    Console().print(f"[dim]Model {model_name} loaded in Metal VRAM.[/dim]")
+    except Exception as exc:
+        log.error(f"Failed to load model %s: %s", model_name, exc)
+        console.print(f"[bold red]Load Error:[/bold red] {exc}")
+        return False
 
 
-def qwen_instruct(system_prompt, user_prompt):
-    """
-    Formats the input required by Qwen2.5/DeepSeek.
-    
-    Parameters
-    ----------
-    system_prompt : str
-        Instructions for the model.
-    user_prompt : str
-        User query.
-    """
-    return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
-
-def choose_model(user_input):
-    """
-    Simple router for model choice, 'code' model is default.
-
-    Parameters
-    ----------
-    user_input : str
-        User query.
-    """
-    keywords = [
-        "explain",
-        "why",
-        "reason",
-        "prove",
-        "step by step",
-        "analysis",
-        "derive",
-    ]
-    if any(k in user_input.lower() for k in keywords):
-        return "reason"
-    return "code"
-
-
-def build_system_prompt(user_input, model_type):
+def build_system_prompt(user_input):
     """
     Constructs the system prompt based on language based keywords or 'reason'.
-
-    Parameters
-    ----------
-    user_input : str
-        User query.
-    model_type : str
-        Model type to use determined by `choose_model` function. 
     """
-    if model_type == "reason":
-        return "You are a careful, analytical assistant. Explain things step by step."
-    else:
-        lower = user_input.lower()
-        if "rust" in lower:
-            return "You are an experienced Rust developer. Write correct, idiomatic Rust code that compiles."
-        elif "kotlin" in lower:
-            return "You are a professional Kotlin developer. Use idiomatic Kotlin patterns and null safety."
-        elif "vim" in lower:
-            return "You are a Vim expert. Give minimal, correct answers."
-        elif "bash" in lower or "zsh" in lower:
-            return "You are a Unix shell expert. Write safe, POSIX-compliant shell scripts."
-        else:
-            return "You are a senior Python engineer. Write clean, idiomatic Python."
+    lower = user_input.lower()
 
-    # return qwen_instruct(system, user_input)
+    if "rust" in lower:
+        return "You are an experienced Rust developer. Write correct, idiomatic Rust code."
+    if "kotlin" in lower:
+        return "You are a Kotlin expert. Use idiomatic patterns and null safety."
+    if "javascript" in lower or " js " in lower or "typescript" in lower:
+        return "You are a JavaScript/TypeScript expert. Write modern, clean code."
+    if "golang" in lower or " go " in lower:
+        return "You are a Go expert. Write idiomatic Go code."
+    if "java" in lower:
+        return "You are a Java expert. Write clean, maintainable code."
+    if "c++" in lower or "cpp" in lower:
+        return "You are a C++ expert. Write efficient, modern code."
+    if "bash" in lower or "shell" in lower or "zsh" in lower:
+        return "You are a Unix shell expert. Write safe, POSIX-compliant scripts."
+    
+    return "You are an expert software engineer. Write clean, well-documented code."
+
+def get_multiline_input() -> str:
+    console.print("\n[dim]Type /help for commands | End line with \\ for multiline[/dim]")
+    first_line = console.input("[bold green]User: [/bold green]")
+
+    if not first_line.endswith("\\"):
+        return first_line.strip()
+
+    lines = [first_line.rstrip("\\")]
+    console.print("[dim]Multiline mode - press Enter on an empty line to send[/dim]")
+
+    while True:
+        line = console.input("[dim]... [/dim]")
+        if line == "":
+            break
+        lines.append(line)
+    
+    return "\n".join(lines).strip()
 
 def handle_command(command: str) -> bool:
     """
-    Handle special commands. Returns True if command was handled.
+    
     """
-    cmd = command.lower().strip()
+    
+    global current_temperature, last_assistant_response
 
-    if cmd in ["/clear", "/new"]:
-        conv_manager.clear(clear_file_tracking = True)
-        console.print("[green] Conversation cleared. [/green]")
-        return True
+    parts = command.strip().split(maxsplit = 1)
+    base = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else None
+    
+    path_7b = CONFIG["model"].get("path_7b", "")
+    path_14b = CONFIG["model"].get("path_14b", "")
 
-    elif cmd == "/save":
-        filepath = conv_manager.save()
-        console.print(f"[green] Conversation saved to: {filepath}[/green]")
-        return True
 
-    elif cmd.startswith("/save "):
-        filename = cmd.split(" ", 1)[1].strip()
-        if not filename.endswith(".json"):
-            filename += ".json"
-        filepath = conv_manager.save(filename)
-        console.print(f"[green] Conversation saved to: {filepath}[/green]")
-        console.print(f"[dim]this file will be used for future auto-saves in this session.[/dim]")
-        return True
+    match base:
 
-    elif cmd.startswith("/load "):
-        filename = cmd.split(" ", 1)[1].strip()
-        if not filename.endswith(".json"):
-            filename += ".json"
-        if conv_manager.load(filename):
-            console.print(f"[green] Conversation loaded.[/green]")
-            console.print(f"[dim]Messages: {len(conv_manager.history)}[/dim]")
-        else:
-            console.print(f"[red] Could not find: {filename}[/red]")
-        return True
+        case "/clear" | "/new":
+            conv_manager.clear(clear_file_tracking = True)
+            console.print("[green] Conversation cleared. [/green]")
+            return True
 
-    elif cmd == "/list":
-        conversations = conv_manager.list_conversations()
-        if not conversations:
-            console.print(f"[yellow]No saved conversations.[/yellow]")
-        else:
-            table = Table(title = "Saved Conversations")
-            table.add_column("Filename", style = "cyan")
-            table.add_column("Created", style = "green")
-            table.add_column("Messages", justify = "right", style = "magenta")
+        case "/save":
+            filename = (arg if arg and arg.endswith(".json") else f"{arg}.json") if arg else None
+            filepath = conv_manager.save(filename)
+            console.print(f"[green]Saved to: {filepath}[/green]")
+            return True
 
-            for conv in conversations:
-                filename = conv["filename"]
-                if filename == conv_manager.current_file:
-                    filename = f">{filename}" # > indicates active session file
+        case "/load":
+            if not arg: 
+                console.print("[yellow]Usage: /load <filename>[/yellow]")
+                return True
+            
+            filename = arg if arg.endswith(".json") else f"{arg}.json"
+            if conv_manager.load(filename):
+                console.print(f"[green]Loaded: {filename}[/green]")
+                console.print(f"[dim]Messages: {len(conv_manager.history)}[/dim]")
+            else:
+                console.print(f"[red]Not found: {filename}[/red]")
+            return True
+        
+        case "/list":
+            conversations = conv_manager.list_conversations()
+            if not conversations:
+                console.print(f"[yellow]No conversations found.[/yellow]")
+            else:
+                table = Table(title = "Saved Conversations")
+                table.add_column("Filename", style = "cyan")
+                table.add_column("Created", style = "green")
+                table.add_column("Messages", justify = "right", style = "magenta")
 
-                table.add_row(
-                    filename,
-                    conv["created"].split("T")[0], # Just date
-                    str(conv["message_count"])
-                )
+                for conv in conversations:
+                    filename = conv["filename"]
+                    if filename == conv_manager.current_file:
+                        filename = f"* {filename}" # * indicates active session file
+
+                    table.add_row(
+                        filename,
+                        conv["created"].split("T")[0], # Just date
+                        str(conv["message_count"])
+                    )
+                
+                console.print(table)
+                if conv_manager.current_file:
+                    console.print(f"\n[dim]* indicates current session file[/dim]")
+            return True
+
+        case "/stats":
+            stats = conv_manager.get_stats()
+            table = Table(title="Conversation Statistics")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Value", style="green")
+            
+            table.add_row("Total Messages", str(stats["total_messages"]))
+            table.add_row("User Messages", str(stats["user_messages"]))
+            table.add_row("Assistant Messages", str(stats["assistant_messages"]))
+            table.add_row("Total Characters", f"{stats['total_characters']:,}")
+            table.add_row("Estimated Tokens", f"{stats['estimated_tokens']:,}")
+            table.add_row("Context Usage", stats["context_usage"])
+            table.add_row("Percent Used", stats["percent_used"])
+            table.add_row("Session File", stats["session_file"])
             
             console.print(table)
+            return True
+
+        case "/history":
+            if not conv_manager.history:
+                console.print(f"[yellow]No history.[/yellow]")
+            else:
+                for i, msg in enumerate(conv_manager.history, 1):
+                    role_color = "green" if msg["role"] == "user" else "blue"
+                    role_label = "You" if msg["role"] == "user" else "Assistant"
+                    console.print(f"\n[bold {role_color}]{i}. {role_label}: [/bold {role_color}]")
+                    console.print(Panel(msg["content"], border_style = role_color))
+            return True
+        
+        case "/sync":
+            if not check_server_status():
+                console.print("[red]Server not reachable.[/red]")
+                return True
             
-            if conv_manager.current_file:
-                console.print(f"\n[dim]> indicates current session file[/dim]")
-        return True
+            console.print(f"[cyan]Syncing...[/cyan]")
+            results = manual_sync_all()
 
-    elif cmd == "/stats":
-        stats = conv_manager.get_stats()
-        table = Table(title = "Conversation statistics")
-        table.add_column("Metric", style = "cyan")
-        table.add_column("Value", style = "green")
+            if results["success"] > 0:
+                console.print(f"[green]Synced {results['success']}/{results['total']}[/green]")
+            if results["failed"] > 0:
+                console.print(f"[yellow]Failed {results['failed']}/{results['total']}[/yellow]")
+            return True
+        
+        case "/server":
+            if check_server_status():
+                console.print("[green]Server online[/green]")
+            else:
+                console.print("[red]Server offline[/red]")
+            return True
+        
+        case "/remote":
+            conversations = list_server_conversations()
+            if not conversations:
+                console.print("[yellow]No remote conversations[/yellow]")
+                return True
 
-        table.add_row("Total Messages", str(stats["total_messages"]))
-        table.add_row("User Messages", str(stats["user_messages"]))
-        table.add_row("Assistant Messages", str(stats["assistant_messages"]))
-        table.add_row("Total Characters", f"{stats['total_characters']:,}")
-        table.add_row("Estimated Tokens", f"{stats['estimated_tokens']:,}")
-        table.add_row("Context Usage", stats["context_usage"])
-        table.add_row("Percent used", stats["percent_used"])
-        table.add_row("Session File", stats["session_file"])
+            table = Table(title = "Remote conversations")
+            table.add_column('Filename', style = 'cyan')
+            table.add_column("Created", style="green")
+            table.add_column("Size", style="magenta")
+            
+            for conv in conversations:
+                table.add_row(
+                    conv.get("filename", "Unknown"),
+                    conv.get("created", "Unknown")[:10],
+                    f"{conv.get('size', 0) / 1024:.1f} KB"
+                )
+            console.print(table)
+            return True
+        
+        case "/pull":
+            if not arg:
+                console.print("[yellow]Usage: /pull <filename>[/yellow]")
+                return True
+            
+            filename = arg if arg.endswith(".json") else f"{arg}.json"
+            console.print(f"[cyan]Downloading {filename}...[/cyan]")
+            if download_from_server(filename, str(CONVERSATION_DIR)):
+                console.print(f"[green]✓ Downloaded to conversations/{filename}[/green]")
+            else:
+                console.print("[red]✗ Download failed - check server status with /server[/red]")
+            return True
+        
+        case "/model7":
+            if not path_7b:
+                console.print("[red]path_7b not set in config.toml[/red]")
+                return True
+            _current_model_name_reset()
+            load_model_once(path_7b, "Qwen2.5-Coder-7B")
+            return True
 
-        console.print(table)
+        case "/model14":
+            if not path_14b:
+                console.print("[red]path_14b not set in config.toml[/red]")
+                return True
+            _current_model_name_reset()
+            load_model_once(path_14b, "Qwen2.5-Coder-14B")
+            return True
+        
+        case "/copy":
+            if not _CLIPBOARD_AVAILABLE:
+                console.print(
+                    f"[red]pyperclip not installed.[/red]\nRun: [bold]pip install pyperclip[/bold]"
+                )
+                return True
+            if not last_assistant_response:
+                console.print("[yellow]No response to copy yet.[/yellow]")
+                return True
+            pyperclip.copy(last_assistant_response)
+            console.print("[green]Copied to clipboard.[/green]")
+            return True
 
-        return True
-    
-    elif cmd == "/history":
-        if not conv_manager.history:
-            console.print("[yellow]No conversation history.[/yellow]")
-        else:
-            for i, msg in enumerate(conv_manager.history, 1):
-                role_color = "green" if msg ["role"] == "user" else "blue"
-                role_label = "You" if msg["role"] == "user" else "Assistant"
+        case "/temp":
+            if not arg:
+                console.print(f"[cyan]Current temperature: {current_temperature}[/cyan]\n[dim]Usage: /temp <value>  (e.g. /temp 0.3 for focused, /temp 1.0 for creative)[/dim]")
+                return True
+            try:
+                new_temp = float(arg)
+                if not (0.0 <= new_temp <= 2.0):
+                    raise ValueError("Temperature out of range.")
+                current_temperature = new_temp
+                console.print(f"[green]Temperature set to {current_temperature}[/green]")
+            except ValueError:
+                console.print(f"[red]Invalid value. Use a number between 0.0 and 2.0[/red]")
+            return True
+        
+        case "/retry":
+            if not conv_manager.history:
+                console.print(f"[yellow]Nothing to retry.[/yellow]")
+                return True
+            
+            if conv_manager.history[-1]["role"] != "assistant":
+                console.print(f"[yellow]Last message is not from assistant nothing to retry.[/yellow]")
+                return True
+
+
+            if _current_model_name is None and not load_model_once(
+                CONFIG["model"].get("default_path", ""), CONFIG["model"].get("default_name", "Unknown")
+            ):
+                return True
+            assert handler is not None
+
+            conv_manager.history.pop()
+            console.print("[cyan]Retrying last response...[/cyan]")
+
+            prompt = conv_manager.build_prompt()
+            full_response = ""
+            first_token_received = False
+            token_count = 0
+            ttft = 0.0
+            start_time_request = time.perf_counter()
+            start_time = 0.0
+
+            default_model_name = _current_model_name
+
+            ctx_tokens = conv_manager.count_tokens(
+                "".join(m["content"] for m in conv_manager.history)
+            )
+
+            def retry_stream_callback(token: str) -> None:
+                nonlocal full_response, first_token_received, token_count, start_time, start_time_request, ttft
                 
-                console.print(f"\n[bold {role_color}]{i}. {role_label}:[/bold {role_color}]")
-                console.print(Panel(msg["content"], border_style = role_color))
-        return True
-    
-    elif cmd == "/help":
-        help_text = """
-[bold cyan]Available commands:[/bold cyan]
+                if not first_token_received:
+                    ttft = time.perf_counter() - start_time_request
+                    first_token_received = True
+                    start_time = time.perf_counter()
+                
+                token_count += 1
+                full_response += token
 
-[bold]/clear, /new[/bold]       - Start a new conversation.
-[bold]/save[/bold]              - Save current conversation (auto-named).
-[bold]/save <name>[/bold]       - Save current conversation with a custom name.
-[bold]/load <name>[/bold]       - Load a saved conversation.
-[bold]/list[/bold]              - List all saved conversations.
-[bold]/history[/bold]           - Show current conversation history.
-[bold]/stats[/bold]             - Show conversation statistics.
-[bold]/help[/bold]              - Show this help message.
-[bold]exit, quit, q[/bold]      - Quit chat.
+                elapsed = time.perf_counter() - start_time
+                tps = token_count / elapsed if elapsed > 0 else 0
 
-[dim]Context window {}/{} tokens (approx)[/dim]
-[dim]Auto-saves at 85% capacity, appends to session file[/dim]
-        """.format(
-            conv_manager.estimate_tokens("".join(msg["content"] for msg in conv_manager.history)),
-            conv_manager.max_tokens
-        )
-        console.print(Panel(help_text, title = "Help", border_style = "cyan"))
-        return True
-    
-    return False
+                retry_live.update(
+                    Panel(
+                        Markdown(full_response),
+                        title=f"[bold cyan]{default_model_name}[/bold cyan] | "
+                              f"[bold gold1]{tps:.1f} tok/s[/bold gold1] | "
+                              f"[dim]ctx {ctx_tokens}/{conv_manager.max_tokens}[/dim]",
+                        subtitle=f"[dim]TTFT: {ttft:.3f}s | temp: {current_temperature}[/dim]",
+                        border_style="cyan",
+                    )
+                )
+            with Live(console = console, refresh_per_second = 20) as retry_live:
+                stop_reason = handler.generate(prompt, retry_stream_callback, current_temperature)
+                if stop_reason == "context_full":
+                    console.print(f"\n[red]Response cut off. Try /clear or ask more concisely.[/red]")
+                if stop_reason == "length_limit":
+                    console.print(f"\n[yellow]Reply hit the token limit. Ask it to continue for the rest.[/yellow]")
+            
+            conv_manager.add_message("assistant", full_response)
+            last_assistant_response = full_response
 
+            elapsed = time.perf_counter() - start_time if start_time > 0 else 0
+            tps = token_count / elapsed if elapsed > 0 else 0
+            console.print(f"\n[dim]Generated {token_count} tokens in {elapsed:.2f}s ({tps:.1f} tok/s)[/dim]")
+            return True
 
+        case "/help":
+            ctx_tokens = conv_manager.count_tokens(
+                "".join(m["content"] for m in conv_manager.history)
+            )
+            help_text = f"""
+[bold cyan]Available Commands:[/bold cyan]
 
+[bold]/clear, /new[/bold]     - Start new conversation
+[bold]/save[/bold]            - Save current conversation
+[bold]/save <n>[/bold]        - Save with custom name
+[bold]/load <n>[/bold]        - Load saved conversation
+[bold]/list[/bold]            - List all conversations
+[bold]/history[/bold]         - Show conversation history
+[bold]/stats[/bold]           - Show statistics
+[bold]/sync[/bold]            - Sync to server
+[bold]/server[/bold]          - Check server status
+[bold]/remote[/bold]          - List remote conversations
+[bold]/pull <n>[/bold]        - Download from server
+[bold]/help[/bold]            - Show this help
+[bold]/model7[/bold]          - Loads qwen 7b, this is the default
+[bold]/model14[/bold]         - Loads qwen 14b, note this is intensive, close all apps before loading
+[bold]/temp <x>[/bold]        - Set sampling temperature (0.0 to 2.0)
+[bold]/retry[/bold]           - Regenerate the last response
+[bold]/copy[/bold]            - Copy the last response to the clipboard
+[bold]exit, quit, q[/bold]    - Exit program
+
+[dim]End a line wiht \\ for multiline input[/dim]
+[dim]Context: {ctx_tokens}/{conv_manager.max_tokens} tokens[/dim]
+"""
+            console.print(Panel(help_text, title="Help", border_style="cyan"))
+            return True
+        
+        case _:
+            # Unknown command
+            return False
+
+def _current_model_name_reset():
+    global _current_model_name
+    _current_model_name = None
 
 def print_gradient_welcome():
     """
@@ -582,30 +878,31 @@ def print_gradient_welcome():
 
 
 def main():
-    global handler
+    global last_assistant_response
+    # global handler
     # Define a glowing color palette for boarder
-    GLOW_COLORS = [
-        "bright_blue",
-        "cyan",
-        "bright_cyan",
-        "white",
-        "bright_white",
-        "cyan",
-        "bright_blue",
-        "blue",
-    ]
-    color_idx = 0
+    # GLOW_COLORS = [
+    #     "bright_blue",
+    #     "cyan",
+    #     "bright_cyan",
+    #     "white",
+    #     "bright_white",
+    #     "cyan",
+    #     "bright_blue",
+    #     "blue",
+    # ]
+    # color_idx = 0
     console.clear()
-
-    abs_deepseek = "/Users/alexanderpenaflor/ai_build/models/DeepSeek-R1-Distill-Qwen-7B-Q5_K_M.gguf"
-    abs_qwen_coder = "/Users/alexanderpenaflor/ai_build/models/qwen2.5-coder-7b-instruct-q5_k_m.gguf"
-    
     print_gradient_welcome()
-    # console.print("\n[dim]Type /help for available commands[/dim]\n")
+
+    default_model_path = CONFIG["model"].get("default_path", "")
+    default_model_name = CONFIG["model"].get("default_name", "Unknown")
+
 
     try:
         while True:
-            user_input = console.input("\n[dim]Type /help for available commands[/dim]\n[bold green]User: [/bold green]")
+
+            user_input = get_multiline_input()
 
             if user_input.lower() in ["exit", "quit", "q"]:
                 # Auto-save on exit if there's conversation history
@@ -619,32 +916,24 @@ def main():
                         filepath = conv_manager.save()
                         console.print(f"[green]Saved to {filepath}[/green]")
                 break
-            
+            if not user_input:
+                continue
+
             # Handle commands
             if user_input.startswith("/"):
                 if handle_command(user_input):
                     continue
+                console.print(f"[yellow]Unknown command: {user_input.split()[0]}[/yellow]")
+                continue
+            # Load model
 
-            # Choose model based on query
-            model_type = choose_model(user_input)
-
-            if model_type == "reason":
-                m_path, m_name = (
-                    abs_deepseek,
-                    "DeepSeek-R1-7B",
-                )
-            else:
-                m_path, m_name = (
-                    abs_qwen_coder,
-                    "Qwen2.5-Coder-7B",
-                )
-
-            # Load model via Rust.
-            load_model_once(m_path, m_name)
-
+            if _current_model_name is None and not load_model_once(default_model_path, default_model_name):
+                continue
+            assert handler is not None
+            
             # Set or update system prompt
-            system_prompt = build_system_prompt(user_input, model_type)
-            conv_manager.set_system_prompt(system_prompt)
+            if not conv_manager._prompt_locked:
+                conv_manager.set_system_prompt(build_system_prompt(user_input))
 
             # Add user message to history
             conv_manager.add_message("user", user_input)
@@ -655,81 +944,113 @@ def main():
             full_response = ""
             first_token_received = False
             token_count = 0
-            
             ttft = 0.0
             start_time_request = time.perf_counter()
             start_time = 0
 
-            progress = Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(bar_width = None, pulse_style = "bright_blue"),
-                console = console,
-                transient = True,
-            )
-
-            progress.add_task("Loading...", total = None)
+            ctx_tokens = conv_manager.estimate_tokens("".join(msg["content"] for msg in conv_manager.history))
+            ctx_info = f"{ctx_tokens}/{conv_manager.max_tokens} tokens"
 
             def stream_callback(token: str):
-                nonlocal \
-                    full_response, \
-                    first_token_received, \
-                    token_count, \
-                    start_time, \
-                    start_time_request, \
-                    ttft, \
-                    color_idx
+                nonlocal full_response, first_token_received, token_count, start_time, start_time_request, ttft
 
                 if not first_token_received:
                     ttft = time.perf_counter() - start_time_request
-                    # print(f"Time to first token: {ttft:.4f}s")
-                # if not first_token_received:
-                    start_time = time.perf_counter()
                     first_token_received = True
-                    progress.stop()
+                    start_time = time.perf_counter()
 
                 token_count += 1
                 full_response += token
 
-                # color_idx = (token_count // 5) % len(GLOW_COLORS)
-                # current_border_color = GLOW_COLORS[color_idx]
-
                 elapsed_time = time.perf_counter() - start_time
                 tps = token_count / elapsed_time if elapsed_time > 0 else 0
-
-                # Show context usage in panel
-                ctx_tokens = conv_manager.estimate_tokens("".join(msg["content"] for msg in conv_manager.history))
-                ctx_info = f"{ctx_tokens}/{conv_manager.max_tokens} tokens"
 
                 live.update(
                     Panel(
                         Markdown(full_response),
-                        title = f"[bold cyan]{m_name}[/bold cyan]\n[bold gold]{tps:.1f} tokens/sec[/bold gold] | [dim]Context: {ctx_info}[/dim]",
+                        title = f"[bold cyan]{_current_model_name}[/bold cyan] | [dim]Context: {ctx_info}[/dim]",
                         subtitle = f"[bold magenta]{tps:.1f} tokens/sec[/bold magenta] | [dim]TTFT: {ttft:.3f}s[/dim]",
                         border_style = "cyan",
                     )
                 )
 
-            # console.print(f"[bold blue] Assitant ({m_name}): [/bold blue]")
-            # progress.start()
-
             with Live(console = console, refresh_per_second=20) as live:
                 # live.update(Panel(progress, title=m_name, border_style="bright_magenta"))
-                start_time_request = time.perf_counter()
-                handler.generate(prompt, stream_callback)
+                # start_time_request = time.perf_counter()
+                
+                try:
+                    stop_reason = handler.generate(prompt, stream_callback, current_temperature)
+                except KeyboardInterrupt:
+                    stop_reason = "stopped"
+                    console.print("\n[yellow]Generation stopped.[/yellow]")
+
+                if stop_reason == "length_limit":
+                    # The reply reached the backend's per-reply cap (1024 tokens). Trimming the history
+                    # would not make room for a longer reply, so keep the history and what was written.
+                    console.print("\n[yellow]Reply hit the token limit. Ask it to continue for the rest.[/yellow]")
+
+                elif stop_reason == "context_full":
+                    console.print("\n[yellow]Response cut off detected. Reducing context and resending.[/yellow]")
+                    
+                    # Save current state
+                
+                    filepath = conv_manager.save()
+                    console.print(f"[dim]Saved to: {filepath}[/dim]")
+                    
+                    # Trim history to last 2 messages
+                    if len(conv_manager.history) > 3:
+                        conv_manager.history = conv_manager.history[-3:]
+                        console.print(f"[dim]Trimmed to last {len(conv_manager.history)} messages[/dim]")
+                    
+                    # Rebuild prompt
+                    prompt = conv_manager.build_prompt()
+                    ctx_tokens = conv_manager.estimate_tokens("".join(msg["content"] for msg in conv_manager.history))
+                    ctx_info = f"{ctx_tokens}/{conv_manager.max_tokens} tokens"
+                    
+                    # Reset tracking
+                    full_response = ""
+                    first_token_received = False
+                    token_count = 0
+                    start_time_request = time.perf_counter()
+
+                    console.print("[cyan]Retrying generation...[/cyan]\n")
+
+                    retry_reason = handler.generate(prompt, stream_callback, current_temperature)
+                    if retry_reason == "context_full":
+                        console.print("\n[red]Still cut off after retry. \nTry clear first.[/red]")
+                    elif retry_reason == "length_limit":
+                        console.print("\n[yellow]Reply hit the token limit. Ask it to continue for the rest.[/yellow]")
+                # with progress:
+                #     task = progress.add_task("Generating...", total = None)
+
+                #     def retry_callback(token):
+                #         nonlocal full_response, first_token_received, token_count, ttft, start_time
+
+                #         if not first_token_received:
+                #             ttft = time.perf_counter() - start_time_request
+                #             first_token_received = True
+                #             start_time = time.perf_counter()
+                        
+                #         full_response += token
+                #         token_count += 1
+
+                #         console.print(f"[blue]{token}[/blue]", end = "")
+                #         progress.update(task, advance = 1)
+                    
+                #     retry_stop_reason = handler.generate(prompt, retry_callback)
+                #     progress.remove_task(task)
 
                 # Add assistant response to history
-                conv_manager.add_message("assistant", full_response)
 
-                live.update(
-                    Panel(
-                        Markdown(full_response), 
-                        title=f"[bold blue]{m_name}[/bold blue]", 
-                        border_style="bright_green"
-                        )
-                    )
+            last_assistant_response = full_response
+            conv_manager.add_message("assistant", full_response)
 
-    except KeyboardInterrupt:
+            elapsed = time.perf_counter() - start_time if start_time > 0 else 0
+            tps = token_count / elapsed if elapsed > 0 else 0
+
+            console.print(f"\n[dim]Generated {token_count} tokens in {elapsed:.2f}s ({tps:.1f} tok/s)[/dim]")
+
+    except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]Interrupted...[/yellow]")
     finally:
         # In Rust, dropping the ModelManager handles cleanup automatically.
